@@ -1,3 +1,5 @@
+import path from "path"
+
 export namespace TestShard {
   export type Info = {
     index: number
@@ -21,6 +23,27 @@ export namespace TestShard {
       return { ok: false as const, error: `Invalid test shard "${input}"; expected 1 <= N <= M <= 1000` }
     }
     return { ok: true as const, value }
+  }
+
+  // Recorded per-file test durations in milliseconds, regenerated from CI junit
+  // artifacts with script/kilocode/test-durations.ts. Shards balance far better
+  // with real durations than with file size: a small PTY test can run for
+  // minutes while a large generated test finishes instantly.
+  export type Durations = {
+    ms: Map<string, number>
+    fallback: number
+  }
+
+  export async function durations(dir: string, platform = process.platform): Promise<Durations | undefined> {
+    for (const name of [`test-durations.${platform}.json`, "test-durations.linux.json"]) {
+      const file = Bun.file(path.join(dir, name))
+      if (!(await file.exists())) continue
+      const data: Record<string, number> = await file.json()
+      const ms = new Map(Object.entries(data))
+      const sorted = [...ms.values()].sort((a, b) => a - b)
+      return { ms, fallback: sorted[Math.floor(sorted.length / 2)] ?? 1 }
+    }
+    return undefined
   }
 
   export function order(files: readonly string[], weight: (file: string) => number) {

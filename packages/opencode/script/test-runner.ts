@@ -155,7 +155,12 @@ if (shard && shard.total > candidates.length) {
   console.error(`Test shard count ${shard.total} exceeds selected file count ${candidates.length}`)
   process.exit(2)
 }
-const weight = (file: string) => Bun.file(path.join(root, "test", file)).size
+const weight = await (async () => {
+  const durations = await TestShard.durations(path.join(root, "script", "kilocode"))
+  if (!durations) return (file: string) => Bun.file(path.join(root, "test", file)).size
+  console.log("Balancing shards with recorded test durations")
+  return (file: string) => durations.ms.get(file) ?? durations.fallback
+})()
 const files = shard ? TestShard.split(candidates, weight, shard.total)[shard.index - 1] : candidates
 
 if (files.length === 0) {
