@@ -102,23 +102,30 @@ async function run() {
     }
 
     if (need.length > 0) {
-      const fresh = await translateBatch(need)
       const newCache: Record<string, string> = { ...cache }
-      for (const item of need) {
-        const raw = fresh.get(item.id)
-        const en = item.text
-        const ok = typeof raw === "string" && raw.length > 0 && keepsPlaceholders(en, raw)
-        if (ok) {
-          translations.set(item.id, raw)
-          newCache[item.id] = en
-          totalNew++
-        } else {
-          // Fallback: keep English so the build/test never breaks.
-          translations.set(item.id, existingFa.get(item.id) ?? en)
-          report.push(`  ! kept fallback for [${dir}] "${item.id}"`)
+      const enById = new Map(need.map((i) => [i.id, i.text]))
+
+      // Persist current state (fa.ts + cache) after each batch so progress
+      // survives rate limits or interruptions.
+      const persist = async (fresh: Map<string, string>) => {
+        for (const [id, raw] of fresh) {
+          if (newCache[id] !== undefined) continue // already committed this batch
+          const en = enById.get(id) ?? ""
+          const ok = raw.length > 0 && keepsPlaceholders(en, raw)
+          if (ok) {
+            translations.set(id, raw)
+            newCache[id] = en
+            totalNew++
+          } else {
+            translations.set(id, existingFa.get(id) ?? en)
+            report.push(`  ! kept fallback for [${dir}] "${id}"`)
+          }
         }
+        await Bun.write(cachePath(dir), JSON.stringify(newCache, null, 2) + "\n")
+        await Bun.write(faPath(dir), retargetImports(rebuild(source, entries, translations)))
       }
-      await Bun.write(cachePath(dir), JSON.stringify(newCache, null, 2) + "\n")
+
+      await translateBatch(need, persist)
     }
 
     const out = retargetImports(rebuild(source, entries, translations))

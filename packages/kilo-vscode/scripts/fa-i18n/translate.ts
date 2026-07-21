@@ -17,6 +17,9 @@
 const API_KEY = process.env.FA_LLM_API_KEY ?? ""
 const BASE_URL = (process.env.FA_LLM_BASE_URL ?? "https://api.openai.com/v1").replace(/\/$/, "")
 const MODEL = process.env.FA_LLM_MODEL ?? "gpt-4o-mini"
+// Some gateways (e.g. Claude-backed) reject the OpenAI json_object response
+// format. Enable it only when the model is known to support it.
+const JSON_MODE = /^(gpt|o[0-9]|openai)/i.test(MODEL)
 
 const SYSTEM = [
   "You are a professional software localization engine.",
@@ -35,11 +38,45 @@ interface Item {
   text: string
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+/** POST to the chat endpoint, retrying on 429/5xx with exponential backoff. */
+async function request(payload: unknown, attempt = 0): Promise<Response> {
+  const res = await fetch(`${BASE_URL}/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${API_KEY}` },
+    body: JSON.stringify(payload),
+  })
+  if (res.ok) return res
+  const retryable = res.status === 429 || res.status >= 500
+  if (retryable && attempt < 8) {
+    const header = Number(res.headers.get("retry-after"))
+    const wait = Number.isFinite(header) && header > 0 ? header * 1000 : Math.min(60000, 2000 * 2 ** attempt)
+    await res.body?.cancel()
+    console.log(`  rate/again ${res.status}; waiting ${Math.round(wait / 1000)}s (attempt ${attempt + 1})`)
+    await sleep(wait)
+    return request(payload, attempt + 1)
+  }
+  const body = await res.text()
+  throw new Error(`LLM request failed ${res.status}: ${body.slice(0, 500)}`)
+}
+
+/** Parse a JSON object from a model reply, tolerating code fences or prose. */
+function extractJson(content: string): Record<string, string> {
+  const trimmed = content.trim()
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/)
+  const candidate = fenced ? fenced[1]! : trimmed
+  const start = candidate.indexOf("{")
+  const end = candidate.lastIndexOf("}")
+  const slice = start >= 0 && end > start ? candidate.slice(start, end + 1) : candidate
+  return JSON.parse(slice) as Record<string, string>
+}
+
 async function callModel(items: Item[]): Promise<Map<string, string>> {
   const payload = {
     model: MODEL,
     temperature: 0,
-    response_format: { type: "json_object" },
+    ...(JSON_MODE ? { response_format: { type: "json_object" } } : {}),
     messages: [
       { role: "system", content: SYSTEM },
       {
@@ -51,22 +88,11 @@ async function callModel(items: Item[]): Promise<Map<string, string>> {
       },
     ],
   }
-  const res = await fetch(`${BASE_URL}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${API_KEY}`,
-    },
-    body: JSON.stringify(payload),
-  })
-  if (!res.ok) {
-    const body = await res.text()
-    throw new Error(`LLM request failed ${res.status}: ${body.slice(0, 500)}`)
-  }
+  const res = await request(payload)
   const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> }
   const content = data.choices?.[0]?.message?.content
   if (!content) throw new Error("LLM returned empty content")
-  const parsed = JSON.parse(content) as Record<string, string>
+  const parsed = extractJson(content)
   const out = new Map<string, string>()
   for (const item of items) {
     const val = parsed[item.id]
@@ -75,16 +101,28 @@ async function callModel(items: Item[]): Promise<Map<string, string>> {
   return out
 }
 
-/** Translate a list of {id,text} in batches, returning id → Persian. */
-export async function translateBatch(items: Item[], batchSize = 40): Promise<Map<string, string>> {
+const BATCH = Number(process.env.FA_LLM_BATCH ?? 15)
+const DELAY = Number(process.env.FA_LLM_DELAY_MS ?? 1500)
+
+/**
+ * Translate items in small batches. `onBatch` is invoked after every successful
+ * batch with the cumulative results so callers can persist progress and survive
+ * interruptions / rate limits.
+ */
+export async function translateBatch(
+  items: Item[],
+  onBatch?: (all: Map<string, string>) => Promise<void> | void,
+): Promise<Map<string, string>> {
   if (!API_KEY) throw new Error("FA_LLM_API_KEY is not set")
   const result = new Map<string, string>()
-  for (let i = 0; i < items.length; i += batchSize) {
-    const slice = items.slice(i, i + batchSize)
+  const total = Math.ceil(items.length / BATCH)
+  for (let i = 0; i < items.length; i += BATCH) {
+    const slice = items.slice(i, i + BATCH)
     const translated = await callModel(slice)
     for (const [k, v] of translated) result.set(k, v)
-    // Basic backoff between batches to be gentle on rate limits.
-    if (i + batchSize < items.length) await new Promise((r) => setTimeout(r, 300))
+    console.log(`  batch ${Math.floor(i / BATCH) + 1}/${total} (${result.size}/${items.length})`)
+    if (onBatch) await onBatch(result)
+    if (i + BATCH < items.length) await sleep(DELAY)
   }
   return result
 }
